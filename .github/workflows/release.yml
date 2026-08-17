@@ -1,0 +1,106 @@
+name: release
+
+# Builds the binaries a release advertises and attaches them, together with
+# their SHA-256 sums, so anyone can check that the file they downloaded is the
+# file this workflow produced from this tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Self-test
+        run: ./build/sdcprobe --self-test
+
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp build/sdcprobe dist/sdcprobe-linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++"
+          cmake --build build
+
+      - name: Self-test
+        run: ./build/sdcprobe.exe --self-test
+
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp build/sdcprobe.exe dist/sdcprobe-windows-x86_64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist/
+
+  publish:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sdcprobe-linux-x86_64
+            dist/sdcprobe-windows-x86_64.exe
+            dist/SHA256SUMS.txt
+          body: |
+            Prebuilt binaries for this tag, produced by the `release` workflow
+            from this commit. Verify with `SHA256SUMS.txt`.
+
+            Both binaries pass `--self-test`, which checks the detector against
+            injected misreads. Run `sdcprobe --self-test` yourself first if you
+            want to confirm the download works before spending hours on a sweep.
+
+            Windows: static build, needs only `KERNEL32.dll` and `msvcrt.dll`.
+            Linux: dynamically linked against the system libstdc++.

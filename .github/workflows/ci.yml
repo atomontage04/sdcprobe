@@ -1,0 +1,91 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: linux / ${{ matrix.compiler }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cxx: g++
+          - compiler: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Version
+        run: ./build/sdcprobe --version
+
+      # The real gate. It proves the detector and the reverse analysis work,
+      # without needing faulty hardware — which no CI runner has.
+      - name: Self-test
+        run: ./build/sdcprobe --self-test
+
+      # A one-minute smoke run: exercises calibration, pinning, the report file
+      # and the summary. It says nothing about hardware — a shared virtual
+      # runner is the worst imaginable place to look for a boost-clock fault.
+      - name: Smoke run
+        run: ./build/sdcprobe --cores 0 --minutes 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdcprobe-linux-${{ matrix.compiler }}
+          path: build/sdcprobe
+
+  windows:
+    name: windows / mingw-w64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Version
+        run: ./build/sdcprobe.exe --version
+
+      - name: Self-test
+        run: ./build/sdcprobe.exe --self-test
+
+      - name: Smoke run
+        run: ./build/sdcprobe.exe --cores 0 --minutes 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdcprobe-windows-x86_64
+          path: build/sdcprobe.exe

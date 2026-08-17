@@ -1,0 +1,59 @@
+name: Bug report
+description: Something is wrong with sdcprobe itself
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: if sdcprobe reported a detection on your machine, that is
+        not a bug in sdcprobe — that is the tool doing its job. Use the
+        **Detection report** template instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `sdcprobe --version`
+      placeholder: sdcprobe 1.0.0 (abc1234), built with gcc 14.2.0 for linux
+    validations:
+      required: true
+
+  - type: textarea
+    id: self-test
+    attributes:
+      label: Self-test output
+      description: Output of `sdcprobe --self-test`. This is the first thing to check.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: Model name, as printed by sdcprobe
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS, and how the binary was obtained
+      placeholder: Windows 11, prebuilt release binary / Debian 13, built with gcc 14.2
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Report file
+      description: The sdcprobe-*.log from the run, if there is one.
+      render: text

@@ -1,0 +1,13 @@
+# Build trees
+build/
+out/
+cmake-build-*/
+
+# Reports produced by running the tool
+sdcprobe-*.log
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
