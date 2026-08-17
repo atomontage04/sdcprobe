@@ -8,7 +8,7 @@ by definition of the instruction set. On some faulty CPUs it is not. `sdcprobe`
 runs one core at a time, verifies every read against the same data taken from
 memory, and tells you exactly which byte came back wrong.
 
-[![build](https://github.com/atomontage/sdcprobe/actions/workflows/ci.yml/badge.svg)](https://github.com/atomontage/sdcprobe/actions/workflows/ci.yml)
+[![build](https://github.com/atomontage04/sdcprobe/actions/workflows/ci.yml/badge.svg)](https://github.com/atomontage04/sdcprobe/actions/workflows/ci.yml)
 
 ---
 
@@ -85,7 +85,7 @@ You need CMake 3.25+ and GCC or Clang. See
 [Building from source](#building-from-source) for Windows specifics.
 
 ```sh
-git clone https://github.com/atomontage/sdcprobe
+git clone https://github.com/atomontage04/sdcprobe
 cd sdcprobe
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
