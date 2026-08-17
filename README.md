@@ -35,10 +35,11 @@ does not know it happened, so nothing downstream does either, until a checksum
 fails to match on retry or a build breaks in a way that does not survive a
 rerun.
 
-Silent Data Corruption (SDC) was named and studied at fleet scale by Google, in
-"Cores that Don't Count" (HotOS 2021), and independently by Meta, in "Silent
-Data Corruptions at Scale" (2021) — both describing production machines that
-passed every qualification test and still, rarely, computed the wrong answer.
+Silent Data Corruption (SDC) was brought to wide attention and studied at fleet
+scale by Google, in "Cores that Don't Count" (HotOS 2021), and independently
+by Meta, in "Silent Data Corruptions at Scale" (2021) — both describing
+production machines that passed every qualification test and still, rarely,
+computed the wrong answer.
 `sdcprobe` — the name is that acronym plus "probe" — does not diagnose SDC in
 general. It narrows the same class of fault down to one instruction small
 enough to reason about completely: a single byte read through the legacy `CH`
@@ -67,7 +68,7 @@ instruction. See [What this tool does not do](#what-this-tool-does-not-do).
 
 ### Prebuilt binaries
 
-Download from [Releases](../../releases), verify against `SHA256SUMS.txt`, then:
+Download from [Releases](https://github.com/atomontage04/sdcprobe/releases), verify against `SHA256SUMS.txt`, then:
 
 ```sh
 # Prove the tool itself works. Takes a second, needs no faulty hardware.
@@ -98,7 +99,7 @@ With no arguments it asks two questions and gets out of the way:
 
 ```
 $ sdcprobe
-sdcprobe 1.0.0 (abc1234)  |  gcc 15.2.0  |  linux
+sdcprobe 1.0.0 (4c94538)  |  x86_64-w64-mingw32 gcc 13-win32  |  windows
 CPU: Intel(R) Core(TM) i9-14900K
 Logical cores available to this process: 32   [0-31]
 
@@ -155,6 +156,11 @@ round and still prints a report.
 
 **Time it out.** `--cores all --minutes 20` on a 32-thread CPU is over ten
 hours. The tool prints the total before starting.
+
+In the shipped configuration (250 ns pacing) the original faulty core produced
+11 detections in 2.44·10⁹ checks — about 10 per 10 minutes. A core with less
+margin loss will take proportionally longer, which is why three runs of
+20 minutes is the floor rather than the target.
 
 ## Reading the output
 
@@ -298,9 +304,8 @@ binary is sound.
   cooling are all candidates and none is established here.
 - **A clean result is not a guarantee.** It means the fault did not reproduce in
   the time given, on the cores tested, at the pacing achieved.
-- **It is not a fix.** If it detects something, the next steps are the usual
-  ones — stock or conservative voltage and power limits, current microcode and
-  BIOS, and your vendor's warranty process.
+- **It is not a fix.**
+  If it detects something, what to do about it is out of scope.
 - **x86-64 only, GCC or Clang only.** MSVC has no x64 inline assembler; the
   build fails at configure time with an explanation. Non-x86 architectures have
   no `CH` register, so the question does not exist there.
@@ -402,6 +407,9 @@ quietly measuring nothing. Do not turn it on.
 If the tool itself misbehaves, the **Bug report** template asks for
 `--self-test` output first, because that answers most questions immediately.
 
+Questions about your own hardware are out of scope.
+This repository cannot tell you what to do about your CPU.
+
 ## Related reading
 
 - Google — "Cores that Don't Count" (HotOS 2021): the paper that put "Silent
@@ -429,8 +437,19 @@ src/version.hpp        version identity
 
 MIT — see [LICENSE](LICENSE).
 
-## DISCLAIMER
-This software was vibe-coded for personal use.
-It helped a lot with debugging a CPU issue.
+## DISCLAIMER: STATUS
 
-The author could not be held responsible for any issue that is caused by the software.
+Unmaintained, published as-is. It was useful once, on one machine, and might
+be useful to someone with the same symptoms. It is not a product: no roadmap,
+no support, no commitment to fix anything, no interest in feature requests.
+Fork it if you need it changed.
+
+Written with heavy AI assistance and verified by measurement rather than by
+review. Every number in this README came from a run: the detector was validated
+on a known-good machine before being trusted on a suspect one, and the fault was
+narrowed by elimination — hypervisor enabled and disabled, each core pinned in
+isolation, three toolchains, MemorySanitizer, Valgrind with origin tracking,
+and a formal bounds audit. That is the whole basis for trusting it. Judge
+accordingly.
+
+No warranty of any kind — see [LICENSE](LICENSE).
