@@ -226,6 +226,12 @@ uint64_t compute_rows(Workspace& work, uint32_t seed, uint32_t rows) {
             uint64_t t0 = 0ull;
             uint64_t t1 = 0ull;
             uint64_t rcx_out = 0ull;
+            // t1 is constrained to "Q" (a/b/c/d), not "r": it is the
+            // destination of `movzbl %ch, ...`, and %ch cannot be encoded in
+            // an instruction that also needs a REX prefix. A plain "r" lets
+            // the allocator hand it r8-r15, which forces REX and makes the
+            // assembler reject the line -- reproducible on some GCC versions,
+            // not others, so it will build fine right up until it doesn't.
             __asm__ volatile("movd   %[f], %%ecx\n\t"
                              "movss  %[f], %[dst]\n\t"
                              "movzbl %%cl, %k[t0]\n\t"
@@ -242,7 +248,7 @@ uint64_t compute_rows(Workspace& work, uint32_t seed, uint32_t rows) {
                              "imul   %[prime], %[t0]\n\t"
                              "xor    %%rcx, %[t0]\n\t"
                              "imul   %[prime], %[t0]\n\t"
-                             : [t0] "=&r"(t0), [t1] "=&r"(t1), "=c"(rcx_out), [dst] "=m"(dst)
+                             : [t0] "=&r"(t0), [t1] "=&Q"(t1), "=c"(rcx_out), [dst] "=m"(dst)
                              : [f] "x"(value), [acc] "r"(acc), [prime] "r"(k_fnv_prime)
                              : "cc");
             acc = t0;
