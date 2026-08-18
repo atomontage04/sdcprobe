@@ -150,6 +150,12 @@ other work was running, and **231 in 12701 rounds** on its own.
 20 minutes per core is the minimum worth trusting. One clean 10-minute run
 proves very little.
 
+**Test every logical core too**, not only physical cores.
+On the machine this tool came from, two SMT siblings of the same physical core,
+at the same multiplier, differed by two orders of magnitude.
+11 detections in ten minutes on one, over a thousand on the other.
+Sharing execution units does not mean sharing the fault rate.
+
 **Expect heat.** One core is pinned at 100% for the whole duration, which is
 exactly the condition that provokes the fault. Ctrl+C stops after the current
 round and still prints a report.
