@@ -6,6 +6,12 @@ cmake_minimum_required(VERSION 3.25)
 
 project(sdcprobe LANGUAGES CXX)
 
+# The rbx probe's payload is an assembly file (see src/rbx.hpp for why). It is
+# assembled by the C++ compiler driver, so that no separate C compiler or
+# assembler has to be found, and the cross build needs nothing extra.
+set(CMAKE_ASM_COMPILER "${CMAKE_CXX_COMPILER}")
+enable_language(ASM)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -28,6 +34,8 @@ add_executable(sdcprobe
     src/load.cpp
     src/logger.cpp
     src/platform.cpp
+    src/rbx.cpp
+    src/rbx_payload.S
 )
 
 target_include_directories(sdcprobe PRIVATE src)

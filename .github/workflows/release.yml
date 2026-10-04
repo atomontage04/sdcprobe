@@ -98,8 +98,8 @@ jobs:
             Prebuilt binaries for this tag, produced by the `release` workflow
             from this commit. Verify with `SHA256SUMS.txt`.
 
-            Both binaries pass `--self-test`, which checks the detector against
-            injected misreads. Run `sdcprobe --self-test` yourself first if you
+            Both binaries pass `--self-test`, which checks both detectors against
+            injected faults. Run `sdcprobe --self-test` yourself first if you
             want to confirm the download works before spending hours on a sweep.
 
             Windows: static build, needs only `KERNEL32.dll` and `msvcrt.dll`.

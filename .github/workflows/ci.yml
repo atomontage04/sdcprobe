@@ -44,6 +44,12 @@ jobs:
       - name: Smoke run
         run: ./build/sdcprobe --cores 0 --minutes 1
 
+      # The same for the second probe. This is also the only place where its
+      # payload - foreign machine code with fixed-address mappings - meets a
+      # kernel and an address space layout nobody chose.
+      - name: Smoke run, rbx probe
+        run: ./build/sdcprobe --probe rbx --cores 0 --minutes 1
+
       - uses: actions/upload-artifact@v4
         with:
           name: sdcprobe-linux-${{ matrix.compiler }}
@@ -84,6 +90,9 @@ jobs:
 
       - name: Smoke run
         run: ./build/sdcprobe.exe --cores 0 --minutes 1
+
+      - name: Smoke run, rbx probe
+        run: ./build/sdcprobe.exe --probe rbx --cores 0 --minutes 1
 
       - uses: actions/upload-artifact@v4
         with:

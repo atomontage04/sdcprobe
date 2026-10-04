@@ -1,8 +1,11 @@
-// sdcprobe — a detector for misreads of the legacy high-byte register CH on
-// x86-64.
+// sdcprobe — a detector for two CPU faults on x86-64: misreads of the legacy
+// high-byte register CH, and a frame base in rbx that changes under a running
+// function. The two probes share the sweep, the pinning and the report and
+// nothing else; this file holds the CH probe and the sweep, rbx.hpp explains
+// the other one.
 //
-// What it looks for
-// -----------------
+// What the CH probe looks for
+// ---------------------------
 // On a faulty CPU, reading a legacy high-byte register (CH) shortly after the
 // full register (ECX) was written sometimes returns the wrong value — usually
 // 00 — while the other three bytes of that same ECX are correct at that same
@@ -56,6 +59,7 @@
 #include "load.hpp"
 #include "logger.hpp"
 #include "platform.hpp"
+#include "rbx.hpp"
 #include "version.hpp"
 
 #include <chrono>
@@ -645,8 +649,119 @@ RunResult run_on_current_cpu(uint32_t cpu_index, uint32_t seed, uint32_t minutes
 }
 
 // ---------------------------------------------------------------------------
-// Core selection parsing
+// Per-core run, rbx probe
 // ---------------------------------------------------------------------------
+
+struct RbxRunResult {
+    uint32_t cpu_index = 0u;
+    uint64_t passes = 0ull;
+    uint64_t calls = 0ull;
+    uint64_t detections = 0ull;
+    // Detections split by what was seen: the frame-base signature, any other
+    // exception inside the probe's code, and a pass that completed with the
+    // wrong hash.
+    uint64_t signature = 0ull;
+    uint64_t other_fault = 0ull;
+    uint64_t mismatch = 0ull;
+    double elapsed_s = 0.0;
+    double ns_per_call = 0.0;
+    bool interrupted = false;
+};
+
+RbxRunResult run_rbx_on_current_cpu(uint32_t cpu_index, uint32_t minutes, Logger& log) {
+    RbxRunResult result;
+    result.cpu_index = cpu_index;
+    uint32_t reported = 0u;
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::minutes(minutes);
+    auto next_progress = start + std::chrono::seconds(k_progress_interval_s);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        // Once per pass, which is about 5 ms. Nothing of the tool's own runs
+        // inside a pass.
+        if (sdc_interrupt_requested()) {
+            result.interrupted = true;
+            break;
+        }
+
+        const RbxPass pass = sdc_rbx_run_pass();
+
+        if (pass.faulted || pass.mismatch) {
+            ++result.detections;
+            const bool signature = pass.faulted && sdc_rbx_is_signature(pass.fault);
+            if (signature) {
+                ++result.signature;
+            } else if (pass.faulted) {
+                ++result.other_fault;
+            } else {
+                ++result.mismatch;
+            }
+            if (reported < k_max_reported_per_cpu) {
+                if (pass.faulted) {
+                    log.line("  DETECT cpu %u pass %llu: %s at %s, rbx-rsp=0x%llx rbp-rsp=0x%llx%s",
+                             cpu_index, static_cast<unsigned long long>(result.passes),
+                             pass.fault.what, sdc_rbx_describe_address(pass.fault.rip).c_str(),
+                             static_cast<unsigned long long>(pass.fault.rbx - pass.fault.rsp),
+                             static_cast<unsigned long long>(pass.fault.rbp - pass.fault.rsp),
+                             signature ? "  [frame base moved by 0xa0]" : "");
+                } else {
+                    log.line("  DETECT cpu %u pass %llu: hash %016llx, expected %016llx",
+                             cpu_index, static_cast<unsigned long long>(result.passes),
+                             static_cast<unsigned long long>(pass.hash),
+                             static_cast<unsigned long long>(pass.expected));
+                }
+                ++reported;
+                if (reported == k_max_reported_per_cpu) {
+                    log.line("  (further detections on this cpu counted but not listed)");
+                }
+            }
+        }
+
+        ++result.passes;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_progress) {
+            const int64_t elapsed_s =
+                std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
+            log.progress("  cpu %-3u [ %5llds / %llds ]  passes %-8llu detections %llu", cpu_index,
+                         static_cast<long long>(elapsed_s),
+                         static_cast<long long>(minutes) * 60ll,
+                         static_cast<unsigned long long>(result.passes),
+                         static_cast<unsigned long long>(result.detections));
+            while (next_progress <= now) {
+                next_progress += std::chrono::seconds(k_progress_interval_s);
+            }
+        }
+    }
+
+    const auto finish = std::chrono::steady_clock::now();
+    result.elapsed_s =
+        static_cast<double>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(finish - start).count()) /
+        1000.0;
+    result.calls = result.passes * k_rbx_calls_per_pass;
+    result.ns_per_call = result.calls != 0ull
+                             ? result.elapsed_s * 1.0e9 / static_cast<double>(result.calls)
+                             : 0.0;
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Probe and core selection parsing
+// ---------------------------------------------------------------------------
+
+struct ProbeSelection {
+    bool ch = true;
+    bool rbx = false;
+};
+
+const char* probe_selection_name(const ProbeSelection& probes) {
+    if (probes.ch && probes.rbx) {
+        return "all";
+    }
+    return probes.rbx ? "rbx" : "ch";
+}
 
 std::string trim(const std::string& text) {
     size_t first = 0u;
@@ -679,6 +794,30 @@ bool equals_ignore_case(const std::string& text, const char* literal) {
         }
     }
     return i == text.size() && literal[i] == '\0';
+}
+
+// Parses "ch", "rbx", "all". An empty answer keeps what `out` already holds.
+bool parse_probe_selection(const std::string& input, ProbeSelection& out) {
+    const std::string text = trim(input);
+    if (text.empty()) {
+        return true;
+    }
+    if (equals_ignore_case(text, "ch")) {
+        out.ch = true;
+        out.rbx = false;
+        return true;
+    }
+    if (equals_ignore_case(text, "rbx")) {
+        out.ch = false;
+        out.rbx = true;
+        return true;
+    }
+    if (equals_ignore_case(text, "all") || equals_ignore_case(text, "both")) {
+        out.ch = true;
+        out.rbx = true;
+        return true;
+    }
+    return false;
 }
 
 // Parses "all", "0,1,2", "5", "0-7", "0-3, 16, 20-23".
@@ -841,38 +980,98 @@ void print_version() {
 void print_usage(std::FILE* out) {
     std::fprintf(
         out,
-        "sdcprobe %s - detector for misreads of the legacy high-byte register CH (x86-64)\n"
+        "sdcprobe %s - detector for two CPU faults on x86-64: misreads of the legacy\n"
+        "high-byte register CH, and a frame base in rbx that changes under a function\n"
         "\n"
-        "  sdcprobe [--cores SPEC] [--minutes N] [--seed N] [--layers N] [--log PATH]\n"
+        "  sdcprobe [--probe ch|rbx|all] [--cores SPEC] [--minutes N] [--seed N]\n"
+        "           [--layers N] [--log PATH]\n"
         "  sdcprobe --self-test\n"
         "  sdcprobe --version | --help\n"
         "\n"
+        "  --probe      what to look for. Default: ch\n"
+        "                 ch   a byte read through CH that differs from memory\n"
+        "                 rbx  a frame base in rbx that moves by itself\n"
+        "                 all  both, one after the other on each core\n"
         "  --cores      which logical cores to test: 'all', or a list such as\n"
         "               '0,1,2' or '0-7,16'. Default: all\n"
-        "  --minutes    duration PER CORE, 1..%u. Default: %u\n"
-        "  --seed       workload seed. Default: %u. Changes the data, not the test\n"
-        "  --layers     workload size, %d..%d. Default: measured at startup so that\n"
-        "               one check takes about %.0f ns on this machine\n"
+        "  --minutes    duration PER CORE AND PROBE, 1..%u. Default: %u\n"
+        "  --seed       workload seed of the ch probe. Default: %u. Changes the\n"
+        "               data, not the test\n"
+        "  --layers     workload size of the ch probe, %d..%d. Default: measured at\n"
+        "               startup so that one check takes about %.0f ns on this machine\n"
         "  --log        report file. Default: sdcprobe-YYYYMMDD-HHMMSS.log\n"
-        "  --self-test  verify the detector against injected misreads and exit.\n"
+        "  --self-test  verify both detectors against injected faults and exit.\n"
         "               Needs no faulty hardware; proves the machinery works\n"
         "\n"
         "  With no arguments the tool asks interactively. Anything given on the\n"
         "  command line is not asked about. With a redirected stdin it never asks.\n"
         "\n"
-        "  Cores are tested ONE AT A TIME, on purpose. The fault only shows on a\n"
-        "  single core at high boost; concurrent load drops the clock and hides it\n"
-        "  completely. Run this on an otherwise idle machine.\n"
+        "  Cores are tested ONE AT A TIME, on purpose. Both faults only show on a\n"
+        "  single core at high boost; concurrent load drops the clock and hides them\n"
+        "  completely. Run this on an otherwise idle machine, and not inside a\n"
+        "  virtual machine: a guest CPU is not a physical core.\n"
         "\n"
-        "  The fault is bursty. A single clean run proves little.\n"
+        "  Both faults are bursty. A single clean run proves little.\n"
         "\n"
         "  Ctrl+C stops after the current round and still prints a partial report.\n"
         "\n"
-        "  Exit codes:  %d clean          %d misread detected\n"
+        "  Exit codes:  %d clean          %d fault detected\n"
         "               %d bad arguments  %d self-test failed   %d interrupted, nothing found\n",
         SDC_VERSION, k_max_minutes, k_default_minutes, k_default_seed, k_load_layers_min,
         k_load_layers_max, k_target_ns_per_sample, k_exit_clean, k_exit_detected, k_exit_usage,
         k_exit_self_test_failed, k_exit_interrupted);
+}
+
+// Self-test of the rbx probe, in the same PASS/FAIL shape as the CH one.
+bool rbx_self_test(Logger& log) {
+    log.line("self-test: verifying the rbx probe against an injected frame-base change");
+
+    std::string problem;
+    if (!sdc_rbx_supported(problem)) {
+        // Not a failure of the machinery: the probe cannot run here at all,
+        // and a real run would refuse with the same message.
+        log.line("  SKIP  %s", problem.c_str());
+        log.blank();
+        log.line("self-test: rbx probe not available on this machine");
+        return true;
+    }
+    if (!sdc_rbx_prepare(problem)) {
+        log.line("  FAIL  cannot set the probe up: %s", problem.c_str());
+        return false;
+    }
+
+    uint32_t passed = 0u;
+    uint32_t failed = 0u;
+    const RbxSelfTest r = sdc_rbx_self_test();
+
+    if (r.clean_pass_ok) {
+        log.line("  PASS  clean pass: %llu calls, hash as computed independently",
+                 static_cast<unsigned long long>(k_rbx_calls_per_pass));
+        ++passed;
+    } else {
+        // Unlike the CH case this cannot be told apart from a broken build, so
+        // it counts as a failure; on a machine that has the fault, repeat it.
+        log.line("  FAIL  clean pass did not complete with the expected hash");
+        ++failed;
+    }
+    if (r.injected_caught) {
+        log.line("  PASS  frame base moved by 0xa0 in call 1000: caught (%s)", r.detail.c_str());
+        ++passed;
+    } else {
+        log.line("  FAIL  frame base moved by 0xa0 in call 1000: nothing was caught");
+        ++failed;
+    }
+    if (r.recovered) {
+        log.line("  PASS  pass after the fault: clean, state was rebuilt");
+        ++passed;
+    } else {
+        log.line("  FAIL  pass after the fault did not complete with the expected hash");
+        ++failed;
+    }
+
+    log.blank();
+    log.line("self-test: %u passed, %u failed", passed, failed);
+    return failed == 0u;
 }
 
 } // namespace
@@ -881,10 +1080,12 @@ int main(int argc, char** argv) {
     uint32_t seed = k_default_seed;
     uint32_t minutes = k_default_minutes;
     int layers = 0; // 0 means "calibrate at startup"
+    ProbeSelection probes;
     std::string cores_spec;
     std::string log_path;
     bool have_minutes = false;
     bool have_cores = false;
+    bool have_probe = false;
     bool want_self_test = false;
 
     for (int i = 1; i < argc;) {
@@ -910,6 +1111,7 @@ int main(int argc, char** argv) {
         const bool known = std::strcmp(flag, "--minutes") == 0 ||
                            std::strcmp(flag, "--seed") == 0 ||
                            std::strcmp(flag, "--cores") == 0 ||
+                           std::strcmp(flag, "--probe") == 0 ||
                            std::strcmp(flag, "--layers") == 0 || std::strcmp(flag, "--log") == 0;
         if (!known) {
             std::fprintf(stderr, "sdcprobe: unexpected argument '%s'\n", flag);
@@ -946,6 +1148,12 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(flag, "--cores") == 0) {
             cores_spec = value;
             have_cores = true;
+        } else if (std::strcmp(flag, "--probe") == 0) {
+            if (value[0] == '\0' || !parse_probe_selection(value, probes)) {
+                std::fprintf(stderr, "sdcprobe: --probe expects ch, rbx or all\n");
+                return k_exit_usage;
+            }
+            have_probe = true;
         } else {
             log_path = value;
         }
@@ -975,8 +1183,11 @@ int main(int argc, char** argv) {
         console.line("CPU: %s", brand_text[0] != '\0' ? brand_text : "unknown");
         console.blank();
         sdc_set_load_layers(layers != 0 ? layers : k_load_layers_default);
-        const bool ok = self_test(work, seed, console);
+        const bool ch_ok = self_test(work, seed, console);
         console.blank();
+        const bool rbx_ok = rbx_self_test(console);
+        console.blank();
+        const bool ok = ch_ok && rbx_ok;
         console.line("RESULT: SELF-TEST %s", ok ? "PASSED" : "FAILED");
         return ok ? k_exit_clean : k_exit_self_test_failed;
     }
@@ -990,6 +1201,35 @@ int main(int argc, char** argv) {
     std::printf("\n");
 
     const bool interactive = sdc_stdin_is_tty();
+
+    // Probe selection.
+    while (!have_probe) {
+        if (!interactive) {
+            std::printf("Probe [ch]: ch   (stdin is not a terminal)\n");
+            break;
+        }
+        std::printf("Probe - 'ch' (CH misread), 'rbx' (frame base) or 'all' [ch]: ");
+        std::fflush(stdout);
+        std::string answer;
+        if (!read_line(answer)) {
+            std::printf("ch   (end of input)\n");
+            break;
+        }
+        if (parse_probe_selection(answer, probes)) {
+            break;
+        }
+        std::printf("  expected ch, rbx or all\n");
+    }
+
+    // Refused before the remaining questions rather than after them: there is
+    // no point asking for a duration the probe cannot use.
+    if (probes.rbx) {
+        std::string problem;
+        if (!sdc_rbx_prepare(problem)) {
+            std::printf("sdcprobe: the rbx probe cannot run here: %s\n", problem.c_str());
+            return k_exit_usage;
+        }
+    }
 
     // Core selection.
     std::vector<CpuInfo> selected;
@@ -1018,15 +1258,19 @@ int main(int argc, char** argv) {
         }
     }
 
+    const uint32_t probe_count = (probes.ch ? 1u : 0u) + (probes.rbx ? 1u : 0u);
+    const char* const minutes_prompt =
+        probe_count > 1u ? "Minutes per core and probe" : "Minutes per core";
+
     // Duration per core.
     while (!have_minutes) {
         std::string answer;
         if (!interactive) {
-            std::printf("Minutes per core [%u]: %u   (stdin is not a terminal)\n",
+            std::printf("%s [%u]: %u   (stdin is not a terminal)\n", minutes_prompt,
                         k_default_minutes, k_default_minutes);
             break;
         }
-        std::printf("Minutes per core [%u]: ", k_default_minutes);
+        std::printf("%s [%u]: ", minutes_prompt, k_default_minutes);
         std::fflush(stdout);
         if (!read_line(answer)) {
             std::printf("%u   (end of input)\n", k_default_minutes);
@@ -1056,34 +1300,47 @@ int main(int argc, char** argv) {
                     log_path.c_str());
     }
 
-    const uint64_t total_minutes = static_cast<uint64_t>(minutes) * selected.size();
+    const uint64_t total_minutes =
+        static_cast<uint64_t>(minutes) * selected.size() * probe_count;
 
     // The header was already on screen before the questions, but the report has
     // to carry it: the file goes to someone who never saw the console.
     log.file_line("sdcprobe %s (%s)  |  %s  |  %s", SDC_VERSION, SDC_GIT_HASH, toolchain_name(),
                   sdc_platform_name());
     log.file_line("CPU: %s", brand_text[0] != '\0' ? brand_text : "unknown");
-    log.line("hot loop: movd %%xmm0,%%ecx / movss / movzbl %%cl / movzbl %%ch  (single thread)");
+    log.line("probe:    %s", probe_selection_name(probes));
+    if (probes.ch) {
+        log.line("ch loop:  movd %%xmm0,%%ecx / movss / movzbl %%cl / movzbl %%ch  (single thread)");
+    }
+    if (probes.rbx) {
+        log.line("rbx loop: emit_i16 with its frame base in rbx, %llu calls per pass"
+                 "  (single thread)",
+                 static_cast<unsigned long long>(k_rbx_calls_per_pass));
+    }
     log.line("report:   %s", log.has_file() ? log.path().c_str() : "(console only)");
     log.blank();
     log.line("cores:    %llu of %llu  [%s]", static_cast<unsigned long long>(selected.size()),
              static_cast<unsigned long long>(available.size()),
              format_cpu_list(selected).c_str());
-    log.line("duration: %u min per core, %llu min total (%.1f h)", minutes,
+    log.line("duration: %u min per core%s, %llu min total (%.1f h)", minutes,
+             probe_count > 1u ? " and probe" : "",
              static_cast<unsigned long long>(total_minutes),
              static_cast<double>(total_minutes) / 60.0);
-    log.line("seed:     %u", seed);
 
-    // Calibration runs pinned to the first selected core, so it measures the
-    // core the sweep is about to start on rather than wherever the scheduler
-    // happened to leave the process.
-    sdc_pin_to_cpu(selected.front());
-    if (layers != 0) {
-        sdc_set_load_layers(layers);
-        log.line("layers:   %d (given on the command line, calibration skipped)",
-                 sdc_load_layers());
-    } else {
-        calibrate_layers(work, seed, log);
+    if (probes.ch) {
+        log.line("seed:     %u", seed);
+
+        // Calibration runs pinned to the first selected core, so it measures
+        // the core the sweep is about to start on rather than wherever the
+        // scheduler happened to leave the process.
+        sdc_pin_to_cpu(selected.front());
+        if (layers != 0) {
+            sdc_set_load_layers(layers);
+            log.line("layers:   %d (given on the command line, calibration skipped)",
+                     sdc_load_layers());
+        } else {
+            calibrate_layers(work, seed, log);
+        }
     }
 
     log.blank();
@@ -1092,8 +1349,11 @@ int main(int argc, char** argv) {
     log.blank();
 
     std::vector<RunResult> results;
+    std::vector<RbxRunResult> rbx_results;
     results.reserve(selected.size());
+    rbx_results.reserve(selected.size());
     uint64_t skipped = 0ull;
+    uint64_t measured_cores = 0ull;
     bool interrupted = false;
 
     for (size_t n = 0u; n < selected.size(); ++n) {
@@ -1122,29 +1382,49 @@ int main(int argc, char** argv) {
             // elsewhere is exactly the case where a report misleads.
             log.line("  WARNING: pinning not confirmed - %s", pin_problem.c_str());
         }
+        ++measured_cores;
 
-        const RunResult result = run_on_current_cpu(cpu.index, seed, minutes, log, work);
-        results.push_back(result);
-        if (result.interrupted) {
-            interrupted = true;
+        bool core_interrupted = false;
+
+        if (probes.ch) {
+            const RunResult result = run_on_current_cpu(cpu.index, seed, minutes, log, work);
+            results.push_back(result);
+            core_interrupted = result.interrupted;
+
+            log.line("  cpu %u ch done: rounds %llu, checks %llu, detections %llu,"
+                     " lanes L0 %llu L1 %llu L2 %llu L3 %llu, multi-byte %llu,"
+                     " value drift %llu, %.0f ns per check%s",
+                     cpu.index, static_cast<unsigned long long>(result.rounds),
+                     static_cast<unsigned long long>(result.checks),
+                     static_cast<unsigned long long>(result.detections),
+                     static_cast<unsigned long long>(result.lane_counts[0]),
+                     static_cast<unsigned long long>(result.lane_counts[1]),
+                     static_cast<unsigned long long>(result.lane_counts[2]),
+                     static_cast<unsigned long long>(result.lane_counts[3]),
+                     static_cast<unsigned long long>(result.unexplained),
+                     static_cast<unsigned long long>(result.value_drift), result.ns_per_check,
+                     result.interrupted ? "  (interrupted)" : "");
         }
 
-        log.line("  cpu %u done: rounds %llu, checks %llu, detections %llu,"
-                 " lanes L0 %llu L1 %llu L2 %llu L3 %llu, multi-byte %llu,"
-                 " value drift %llu, %.0f ns per check%s",
-                 cpu.index, static_cast<unsigned long long>(result.rounds),
-                 static_cast<unsigned long long>(result.checks),
-                 static_cast<unsigned long long>(result.detections),
-                 static_cast<unsigned long long>(result.lane_counts[0]),
-                 static_cast<unsigned long long>(result.lane_counts[1]),
-                 static_cast<unsigned long long>(result.lane_counts[2]),
-                 static_cast<unsigned long long>(result.lane_counts[3]),
-                 static_cast<unsigned long long>(result.unexplained),
-                 static_cast<unsigned long long>(result.value_drift), result.ns_per_check,
-                 result.interrupted ? "  (interrupted)" : "");
+        if (probes.rbx && !core_interrupted) {
+            const RbxRunResult result = run_rbx_on_current_cpu(cpu.index, minutes, log);
+            rbx_results.push_back(result);
+            core_interrupted = result.interrupted;
+
+            log.line("  cpu %u rbx done: passes %llu, calls %llu, detections %llu,"
+                     " frame base %llu, other fault %llu, wrong hash %llu, %.1f ns per call%s",
+                     cpu.index, static_cast<unsigned long long>(result.passes),
+                     static_cast<unsigned long long>(result.calls),
+                     static_cast<unsigned long long>(result.detections),
+                     static_cast<unsigned long long>(result.signature),
+                     static_cast<unsigned long long>(result.other_fault),
+                     static_cast<unsigned long long>(result.mismatch), result.ns_per_call,
+                     result.interrupted ? "  (interrupted)" : "");
+        }
         log.blank();
 
-        if (result.interrupted) {
+        if (core_interrupted) {
+            interrupted = true;
             const size_t remaining = selected.size() - (n + 1u);
             if (remaining != 0u) {
                 log.line("--- interrupted; %llu core(s) not tested ---",
@@ -1155,7 +1435,7 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
-    // Verdict
+    // Summary
     // -----------------------------------------------------------------------
 
     uint64_t total_rounds = 0ull;
@@ -1182,53 +1462,111 @@ int main(int argc, char** argv) {
         }
     }
 
-    log.line("=========================== SUMMARY ===========================");
-    log.line("  cpu    rounds       checks         detections   L0    L1    L2    L3   multi");
-    for (const RunResult& r : results) {
-        log.line("  %-5u  %-11llu  %-13llu  %-11llu  %-5llu %-5llu %-5llu %-5llu %llu",
-                 r.cpu_index, static_cast<unsigned long long>(r.rounds),
-                 static_cast<unsigned long long>(r.checks),
-                 static_cast<unsigned long long>(r.detections),
-                 static_cast<unsigned long long>(r.lane_counts[0]),
-                 static_cast<unsigned long long>(r.lane_counts[1]),
-                 static_cast<unsigned long long>(r.lane_counts[2]),
-                 static_cast<unsigned long long>(r.lane_counts[3]),
-                 static_cast<unsigned long long>(r.unexplained));
-    }
-    log.line("---------------------------------------------------------------");
-    log.line("cores tested:      %llu of %llu   (skipped %llu)",
-             static_cast<unsigned long long>(results.size()),
-             static_cast<unsigned long long>(selected.size()),
-             static_cast<unsigned long long>(skipped));
-    log.line("workload:          %d layers, %.0f ns per check", sdc_load_layers(), worst_ns);
-    log.line("elapsed:           %.1f s (%.2f h)", total_elapsed_s, total_elapsed_s / 3600.0);
-    log.line("rounds performed:  %llu", static_cast<unsigned long long>(total_rounds));
-    log.line("CHECKS PERFORMED:  %llu   (one check = one CH read verified against memory)",
-             static_cast<unsigned long long>(total_checks));
-    log.line("detections:        %llu", static_cast<unsigned long long>(total_detections));
-    log.line("lanes:             L0(cl) %llu   L1(ch) %llu   L2(shr16) %llu   L3(shr24) %llu"
-             "   multi-byte %llu",
-             static_cast<unsigned long long>(total_lanes[0]),
-             static_cast<unsigned long long>(total_lanes[1]),
-             static_cast<unsigned long long>(total_lanes[2]),
-             static_cast<unsigned long long>(total_lanes[3]),
-             static_cast<unsigned long long>(total_unexplained));
-    log.line("value drift:       %llu   (samples differing from round 0)",
-             static_cast<unsigned long long>(total_drift));
+    uint64_t rbx_total_passes = 0ull;
+    uint64_t rbx_total_calls = 0ull;
+    uint64_t rbx_total_detections = 0ull;
+    uint64_t rbx_total_signature = 0ull;
+    uint64_t rbx_total_other = 0ull;
+    uint64_t rbx_total_mismatch = 0ull;
+    double rbx_total_elapsed_s = 0.0;
 
-    // The interval between CH reads is part of the conditions under which the
-    // fault is observable at all. Drifting off it does not make the result
-    // wrong, but it makes a clean result weigh less, and that cannot go unsaid.
-    if (worst_ns > 0.0 && (worst_ns > k_target_ns_per_sample * k_ns_tolerance_factor ||
-                           worst_ns < k_target_ns_per_sample / k_ns_tolerance_factor)) {
+    for (const RbxRunResult& r : rbx_results) {
+        rbx_total_passes += r.passes;
+        rbx_total_calls += r.calls;
+        rbx_total_detections += r.detections;
+        rbx_total_signature += r.signature;
+        rbx_total_other += r.other_fault;
+        rbx_total_mismatch += r.mismatch;
+        rbx_total_elapsed_s += r.elapsed_s;
+    }
+
+    if (probes.ch) {
+        log.line("=========================== SUMMARY ===========================");
+        log.line("  cpu    rounds       checks         detections   L0    L1    L2    L3   multi");
+        for (const RunResult& r : results) {
+            log.line("  %-5u  %-11llu  %-13llu  %-11llu  %-5llu %-5llu %-5llu %-5llu %llu",
+                     r.cpu_index, static_cast<unsigned long long>(r.rounds),
+                     static_cast<unsigned long long>(r.checks),
+                     static_cast<unsigned long long>(r.detections),
+                     static_cast<unsigned long long>(r.lane_counts[0]),
+                     static_cast<unsigned long long>(r.lane_counts[1]),
+                     static_cast<unsigned long long>(r.lane_counts[2]),
+                     static_cast<unsigned long long>(r.lane_counts[3]),
+                     static_cast<unsigned long long>(r.unexplained));
+        }
+        log.line("---------------------------------------------------------------");
+        log.line("cores tested:      %llu of %llu   (skipped %llu)",
+                 static_cast<unsigned long long>(results.size()),
+                 static_cast<unsigned long long>(selected.size()),
+                 static_cast<unsigned long long>(skipped));
+        log.line("workload:          %d layers, %.0f ns per check", sdc_load_layers(), worst_ns);
+        log.line("elapsed:           %.1f s (%.2f h)", total_elapsed_s, total_elapsed_s / 3600.0);
+        log.line("rounds performed:  %llu", static_cast<unsigned long long>(total_rounds));
+        log.line("CHECKS PERFORMED:  %llu   (one check = one CH read verified against memory)",
+                 static_cast<unsigned long long>(total_checks));
+        log.line("detections:        %llu", static_cast<unsigned long long>(total_detections));
+        log.line("lanes:             L0(cl) %llu   L1(ch) %llu   L2(shr16) %llu   L3(shr24) %llu"
+                 "   multi-byte %llu",
+                 static_cast<unsigned long long>(total_lanes[0]),
+                 static_cast<unsigned long long>(total_lanes[1]),
+                 static_cast<unsigned long long>(total_lanes[2]),
+                 static_cast<unsigned long long>(total_lanes[3]),
+                 static_cast<unsigned long long>(total_unexplained));
+        log.line("value drift:       %llu   (samples differing from round 0)",
+                 static_cast<unsigned long long>(total_drift));
+
+        // The interval between CH reads is part of the conditions under which
+        // the fault is observable at all. Drifting off it does not make the
+        // result wrong, but it makes a clean result weigh less, and that cannot
+        // go unsaid.
+        if (worst_ns > 0.0 && (worst_ns > k_target_ns_per_sample * k_ns_tolerance_factor ||
+                               worst_ns < k_target_ns_per_sample / k_ns_tolerance_factor)) {
+            log.blank();
+            log.line("WARNING: %.0f ns per check, expected around %.0f. The workload is not"
+                     " pacing",
+                     worst_ns, k_target_ns_per_sample);
+            log.line("this machine as intended, so sensitivity is reduced. Try --layers N.");
+        }
         log.blank();
-        log.line("WARNING: %.0f ns per check, expected around %.0f. The workload is not pacing",
-                 worst_ns, k_target_ns_per_sample);
-        log.line("this machine as intended, so sensitivity is reduced. Try --layers N.");
     }
 
-    log.blank();
-    if (results.empty()) {
+    if (probes.rbx) {
+        log.line("======================== SUMMARY: rbx ========================");
+        log.line("  cpu    passes       calls          detections   frame-base  other  hash");
+        for (const RbxRunResult& r : rbx_results) {
+            log.line("  %-5u  %-11llu  %-13llu  %-11llu  %-10llu  %-5llu  %llu", r.cpu_index,
+                     static_cast<unsigned long long>(r.passes),
+                     static_cast<unsigned long long>(r.calls),
+                     static_cast<unsigned long long>(r.detections),
+                     static_cast<unsigned long long>(r.signature),
+                     static_cast<unsigned long long>(r.other_fault),
+                     static_cast<unsigned long long>(r.mismatch));
+        }
+        log.line("---------------------------------------------------------------");
+        log.line("cores tested:      %llu of %llu   (skipped %llu)",
+                 static_cast<unsigned long long>(rbx_results.size()),
+                 static_cast<unsigned long long>(selected.size()),
+                 static_cast<unsigned long long>(skipped));
+        log.line("elapsed:           %.1f s (%.2f h)", rbx_total_elapsed_s,
+                 rbx_total_elapsed_s / 3600.0);
+        log.line("passes performed:  %llu", static_cast<unsigned long long>(rbx_total_passes));
+        log.line("CALLS PERFORMED:   %llu   (one call = one frame set up, used and torn down"
+                 " through rbx)",
+                 static_cast<unsigned long long>(rbx_total_calls));
+        log.line("detections:        %llu", static_cast<unsigned long long>(rbx_total_detections));
+        log.line("kinds:             frame base moved by 0xa0: %llu   other fault: %llu"
+                 "   wrong hash: %llu",
+                 static_cast<unsigned long long>(rbx_total_signature),
+                 static_cast<unsigned long long>(rbx_total_other),
+                 static_cast<unsigned long long>(rbx_total_mismatch));
+        log.blank();
+    }
+
+    // -----------------------------------------------------------------------
+    // Verdict
+    // -----------------------------------------------------------------------
+
+    if (measured_cores == 0ull) {
         // Every core was skipped, so nothing was measured at all. Reporting
         // that as CLEAN would be the worst possible outcome: a green result
         // that means the opposite of what it says.
@@ -1242,33 +1580,77 @@ int main(int argc, char** argv) {
         log.close();
         return k_exit_usage;
     }
-    if (total_detections != 0ull) {
-        log.line("RESULT: CH MISREAD DETECTED - %llu detections in %llu checks across"
-                 " %llu core(s)",
-                 static_cast<unsigned long long>(total_detections),
-                 static_cast<unsigned long long>(total_checks),
-                 static_cast<unsigned long long>(results.size()));
-        log.line("A byte read through the legacy high-byte register did not match the same byte");
-        log.line("read from memory, within one pass over identical data. That cannot be a");
-        log.line("software bug: the instruction sequence is deterministic.");
-        log.line("Affected cores:");
-        for (const RunResult& r : results) {
-            if (r.detections != 0ull) {
-                log.line("  cpu %u - %llu detections in %llu checks", r.cpu_index,
-                         static_cast<unsigned long long>(r.detections),
-                         static_cast<unsigned long long>(r.checks));
+
+    if (probes.ch) {
+        if (total_detections != 0ull) {
+            log.line("RESULT: CH MISREAD DETECTED - %llu detections in %llu checks across"
+                     " %llu core(s)",
+                     static_cast<unsigned long long>(total_detections),
+                     static_cast<unsigned long long>(total_checks),
+                     static_cast<unsigned long long>(results.size()));
+            log.line("A byte read through the legacy high-byte register did not match the same"
+                     " byte");
+            log.line("read from memory, within one pass over identical data. That cannot be a");
+            log.line("software bug: the instruction sequence is deterministic.");
+            log.line("Affected cores:");
+            for (const RunResult& r : results) {
+                if (r.detections != 0ull) {
+                    log.line("  cpu %u - %llu detections in %llu checks", r.cpu_index,
+                             static_cast<unsigned long long>(r.detections),
+                             static_cast<unsigned long long>(r.checks));
+                }
             }
+        } else if (interrupted) {
+            log.line("RESULT: INTERRUPTED - no misread in %llu checks across %llu core(s) so far",
+                     static_cast<unsigned long long>(total_checks),
+                     static_cast<unsigned long long>(results.size()));
+            log.line("The sweep did not finish, so this is not a clean result. It is a partial"
+                     " one.");
+        } else {
+            log.line("RESULT: CLEAN - no misread in %llu checks across %llu core(s)",
+                     static_cast<unsigned long long>(total_checks),
+                     static_cast<unsigned long long>(results.size()));
+            log.line("This means the fault did not reproduce here, not that the machine is"
+                     " sound.");
         }
-    } else if (interrupted) {
-        log.line("RESULT: INTERRUPTED - no misread in %llu checks across %llu core(s) so far",
-                 static_cast<unsigned long long>(total_checks),
-                 static_cast<unsigned long long>(results.size()));
-        log.line("The sweep did not finish, so this is not a clean result. It is a partial one.");
-    } else {
-        log.line("RESULT: CLEAN - no misread in %llu checks across %llu core(s)",
-                 static_cast<unsigned long long>(total_checks),
-                 static_cast<unsigned long long>(results.size()));
-        log.line("This means the fault did not reproduce here, not that the machine is sound.");
+    }
+
+    if (probes.rbx) {
+        if (probes.ch) {
+            log.blank();
+        }
+        if (rbx_total_detections != 0ull) {
+            log.line("RESULT: RBX FAULT DETECTED - %llu detections in %llu calls across"
+                     " %llu core(s)",
+                     static_cast<unsigned long long>(rbx_total_detections),
+                     static_cast<unsigned long long>(rbx_total_calls),
+                     static_cast<unsigned long long>(rbx_results.size()));
+            log.line("Code that runs correctly billions of times in a row raised a hardware");
+            log.line("exception, on data that never changes. Where the registers show rbx ahead"
+                     " of");
+            log.line("rsp by 0xa0, the function's frame base changed with no instruction"
+                     " writing it.");
+            log.line("Affected cores:");
+            for (const RbxRunResult& r : rbx_results) {
+                if (r.detections != 0ull) {
+                    log.line("  cpu %u - %llu detections in %llu calls", r.cpu_index,
+                             static_cast<unsigned long long>(r.detections),
+                             static_cast<unsigned long long>(r.calls));
+                }
+            }
+        } else if (interrupted) {
+            log.line("RESULT: INTERRUPTED - no rbx fault in %llu calls across %llu core(s) so far",
+                     static_cast<unsigned long long>(rbx_total_calls),
+                     static_cast<unsigned long long>(rbx_results.size()));
+            log.line("The sweep did not finish, so this is not a clean result. It is a partial"
+                     " one.");
+        } else {
+            log.line("RESULT: CLEAN - no rbx fault in %llu calls across %llu core(s)",
+                     static_cast<unsigned long long>(rbx_total_calls),
+                     static_cast<unsigned long long>(rbx_results.size()));
+            log.line("This means the fault did not reproduce here, not that the machine is"
+                     " sound.");
+        }
     }
 
     if (log.has_file()) {
@@ -1277,7 +1659,7 @@ int main(int argc, char** argv) {
     }
     log.close();
 
-    if (total_detections != 0ull) {
+    if (total_detections != 0ull || rbx_total_detections != 0ull) {
         return k_exit_detected;
     }
     if (interrupted) {

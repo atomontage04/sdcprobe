@@ -26,10 +26,30 @@ bool sdc_interrupt_requested() {
     return g_interrupt != 0;
 }
 
+namespace {
+
+// Fault capture state. One thread, one payload: plain globals are the honest
+// representation, and a handler can reach nothing else anyway.
+FaultRecord* volatile g_fault_record = nullptr;
+const void* volatile g_fault_resume = nullptr;
+
+} // namespace
+
+void sdc_fault_capture_arm(FaultRecord* record, const void* resume_at) {
+    g_fault_resume = resume_at;
+    g_fault_record = record;
+}
+
+void sdc_fault_capture_disarm() {
+    g_fault_record = nullptr;
+}
+
 #if defined(_WIN32)
 
 #include <io.h>
 #include <windows.h>
+
+#include <intrin.h>
 
 namespace {
 
@@ -130,9 +150,116 @@ const char* sdc_platform_name() {
     return "windows";
 }
 
+void* sdc_map_fixed(uint64_t address, size_t size) {
+    // VirtualAlloc with an explicit address either gets that address or fails;
+    // it rounds down to the 64 KiB allocation granularity, which the callers
+    // already respect.
+    void* base = VirtualAlloc(reinterpret_cast<void*>(address), size, MEM_RESERVE | MEM_COMMIT,
+                              PAGE_READWRITE);
+    if (base != reinterpret_cast<void*>(address)) {
+        if (base != nullptr) {
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+        return nullptr;
+    }
+    return base;
+}
+
+void sdc_unmap(void* base, size_t) {
+    VirtualFree(base, 0, MEM_RELEASE);
+}
+
+namespace {
+
+// Offset of ArbitraryUserPointer in the 64-bit TEB. Documented in the public
+// NT_TIB definition, and stable since the first x64 Windows.
+constexpr unsigned long k_teb_user_pointer = 0x28ul;
+
+unsigned long long g_saved_user_pointer = 0ull;
+
+const char* exception_name(DWORD code) {
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+        return "access violation";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        return "illegal instruction";
+    case EXCEPTION_PRIV_INSTRUCTION:
+        return "privileged instruction";
+    case EXCEPTION_STACK_OVERFLOW:
+        return "stack overflow";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        return "integer divide by zero";
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+        return "misaligned access";
+    case EXCEPTION_IN_PAGE_ERROR:
+        return "in-page error";
+    case EXCEPTION_BREAKPOINT:
+        return "breakpoint";
+    default:
+        return "hardware exception";
+    }
+}
+
+// A vectored handler rather than a frame-based one: vectored handlers run
+// before any unwinding is attempted, and the payload has no unwind tables to
+// attempt it with.
+LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
+    FaultRecord* record = g_fault_record;
+    if (record == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    // Only errors. Informational and warning codes (debug output, C++ throws
+    // have their own severity bits) are not the payload misbehaving.
+    if ((code & 0xC0000000ul) != 0xC0000000ul && code != EXCEPTION_BREAKPOINT) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    g_fault_record = nullptr;
+
+    CONTEXT* context = info->ContextRecord;
+    record->what = exception_name(code);
+    record->address = 0u;
+    if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) &&
+        info->ExceptionRecord->NumberParameters >= 2) {
+        record->address = info->ExceptionRecord->ExceptionInformation[1];
+    }
+    record->rip = context->Rip;
+    record->rsp = context->Rsp;
+    record->rbp = context->Rbp;
+    record->rbx = context->Rbx;
+    record->rax = context->Rax;
+    record->rcx = context->Rcx;
+    record->rdx = context->Rdx;
+    record->rsi = context->Rsi;
+    record->rdi = context->Rdi;
+
+    context->Rip = reinterpret_cast<DWORD64>(g_fault_resume);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+} // namespace
+
+bool sdc_payload_tp_enter(void* value) {
+    g_saved_user_pointer = __readgsqword(k_teb_user_pointer);
+    __writegsqword(k_teb_user_pointer, reinterpret_cast<unsigned long long>(value));
+    return true;
+}
+
+void sdc_payload_tp_leave() {
+    __writegsqword(k_teb_user_pointer, g_saved_user_pointer);
+}
+
+bool sdc_fault_capture_install() {
+    return AddVectoredExceptionHandler(1, on_exception) != nullptr;
+}
+
 #elif defined(__linux__)
 
+#include <asm/prctl.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 void sdc_install_interrupt_handler() {
@@ -194,6 +321,125 @@ bool sdc_stdin_is_tty() {
 
 const char* sdc_platform_name() {
     return "linux";
+}
+
+void* sdc_map_fixed(uint64_t address, size_t size) {
+    // MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently tear down whatever
+    // already lives there. On kernels older than 4.17 the flag is ignored and
+    // the address becomes a hint, which the comparison below catches.
+    void* base = mmap(reinterpret_cast<void*>(address), size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (base == MAP_FAILED) {
+        return nullptr;
+    }
+    if (base != reinterpret_cast<void*>(address)) {
+        munmap(base, size);
+        return nullptr;
+    }
+    return base;
+}
+
+void sdc_unmap(void* base, size_t size) {
+    munmap(base, size);
+}
+
+namespace {
+
+// What the gs base points at. Only the slot at 0x28 is ever read.
+uint64_t g_gs_block[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+bool g_gs_installed = false;
+
+// Signals are delivered on their own stack: a payload that has gone wrong may
+// well have a stack pointer nobody should push a signal frame onto.
+alignas(16) unsigned char g_signal_stack[64 * 1024];
+
+const char* signal_name(int number) {
+    switch (number) {
+    case SIGSEGV:
+        return "access violation";
+    case SIGBUS:
+        return "bus error";
+    case SIGILL:
+        return "illegal instruction";
+    case SIGFPE:
+        return "arithmetic exception";
+    case SIGTRAP:
+        return "breakpoint";
+    default:
+        return "hardware exception";
+    }
+}
+
+void on_fault(int number, siginfo_t* info, void* raw_context) {
+    FaultRecord* record = g_fault_record;
+    if (record == nullptr) {
+        // Not ours: a genuine crash of the tool. Put the default action back
+        // and return; the instruction faults again and the process dies the
+        // ordinary way, core dump included.
+        std::signal(number, SIG_DFL);
+        return;
+    }
+    g_fault_record = nullptr;
+
+    ucontext_t* context = static_cast<ucontext_t*>(raw_context);
+    greg_t* regs = context->uc_mcontext.gregs;
+    record->what = signal_name(number);
+    record->address = (number == SIGSEGV || number == SIGBUS)
+                          ? reinterpret_cast<uint64_t>(info->si_addr)
+                          : 0u;
+    record->rip = static_cast<uint64_t>(regs[REG_RIP]);
+    record->rsp = static_cast<uint64_t>(regs[REG_RSP]);
+    record->rbp = static_cast<uint64_t>(regs[REG_RBP]);
+    record->rbx = static_cast<uint64_t>(regs[REG_RBX]);
+    record->rax = static_cast<uint64_t>(regs[REG_RAX]);
+    record->rcx = static_cast<uint64_t>(regs[REG_RCX]);
+    record->rdx = static_cast<uint64_t>(regs[REG_RDX]);
+    record->rsi = static_cast<uint64_t>(regs[REG_RSI]);
+    record->rdi = static_cast<uint64_t>(regs[REG_RDI]);
+
+    // Returning from the handler restores this context, so execution continues
+    // at the landing point with the signal mask back to what it was.
+    regs[REG_RIP] = static_cast<greg_t>(reinterpret_cast<uint64_t>(g_fault_resume));
+}
+
+} // namespace
+
+bool sdc_payload_tp_enter(void* value) {
+    g_gs_block[5] = reinterpret_cast<uint64_t>(value);
+    if (!g_gs_installed) {
+        if (syscall(SYS_arch_prctl, ARCH_SET_GS, g_gs_block) != 0) {
+            return false;
+        }
+        g_gs_installed = true;
+    }
+    return true;
+}
+
+void sdc_payload_tp_leave() {
+    // The gs base stays where it is: nothing else in a 64-bit Linux process
+    // uses it, and setting it is a system call that has no business running
+    // between two passes of a measured loop.
+}
+
+bool sdc_fault_capture_install() {
+    stack_t stack;
+    stack.ss_sp = g_signal_stack;
+    stack.ss_size = sizeof(g_signal_stack);
+    stack.ss_flags = 0;
+    if (sigaltstack(&stack, nullptr) != 0) {
+        return false;
+    }
+    struct sigaction action;
+    sigemptyset(&action.sa_mask);
+    action.sa_sigaction = on_fault;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    const int numbers[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
+    for (const int number : numbers) {
+        if (sigaction(number, &action, nullptr) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 #else

@@ -7,7 +7,7 @@
 // answers "which code is this exactly", which is the only question that gets
 // asked.
 
-#define SDC_VERSION "1.0.0"
+#define SDC_VERSION "1.1.0"
 
 // Filled in by CMake from `git rev-parse --short HEAD` when the source tree is
 // a git checkout. Released archives and tarballs build fine without it.
