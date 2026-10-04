@@ -76,7 +76,7 @@ address.
 ## Conditions
 
 Seen on an Intel Core i9-14900K under WSL2. The rate is between one event per
-15 s and one per 110 s of run time, alone on an otherwise idle machine, and it
+15 s and one per 140 s of run time, alone on an otherwise idle machine, and it
 drifts over minutes: a block of eight runs without a single event sits next to a
 block where six of eight are red. Two rules follow: a short clean run proves
 nothing, and conditions can only be compared by alternating runs. Alternated,
@@ -94,7 +94,8 @@ nothing, and conditions can only be compared by alternating runs. Alternated,
 Built with `-O1`: 0 of 7. Under WSL2, pinning to a guest CPU does not select a
 physical core (5 red of 10 with `taskset -c 2`): the hypervisor decides which
 core a busy virtual processor runs on. Pinning by core only means something
-without a hypervisor — which is what sdcprobe's rbx probe is for.
+without a hypervisor — which is what sdcprobe's rbx probe is for: run on Windows
+itself, it caught the fault on the core where the `CH` fault had been found.
 
 ## Cause
 

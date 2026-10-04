@@ -35,7 +35,7 @@ A function whose frame is both over-aligned and dynamically sized keeps the
 frame base in `rbx`: `sub $0xa0,%rsp` then `mov %rsp,%rbx`, and every local is
 addressed through `rbx` from there on. On the same machine, after the `CH` fault
 had been tuned away by lowering the core multiplier, such a function would —
-once in a few billion calls — find `rbx` equal to `rsp + 0xa0`: the value `rsp` had
+once in billions of calls — find `rbx` equal to `rsp + 0xa0`: the value `rsp` had
 *before* the `sub`. No instruction writes that value into `rbx`, and it exists
 nowhere in memory or in any saved context; it exists only inside the processor.
 The function then reads its locals out of its caller's frame, and the program
@@ -122,7 +122,7 @@ With no arguments it asks three questions and gets out of the way:
 
 ```
 $ sdcprobe
-sdcprobe 1.1.0 (4c94538)  |  x86_64-w64-mingw32 gcc 13-win32  |  windows
+sdcprobe 1.1.0 (19dc032)  |  x86_64-w64-mingw32 gcc 13-win32  |  windows
 CPU: Intel(R) Core(TM) i9-14900K
 Logical cores available to this process: 32   [0-31]
 
@@ -165,7 +165,7 @@ Exit codes:
 |---:|---|
 | 0 | clean, sweep completed |
 | 1 | fault detected, by either probe |
-| 2 | bad arguments, or no core could be measured |
+| 2 | bad arguments, no core could be measured, or the rbx probe cannot run here |
 | 3 | self-test failed |
 | 4 | interrupted before finishing, nothing found |
 
@@ -191,17 +191,20 @@ exactly the condition that provokes the fault. Ctrl+C stops after the current
 round and still prints a report.
 
 **Not in a virtual machine.** Pinning to a guest CPU does not select a physical
-core. Under WSL2 the rbx fault showed up just as often with the process pinned
-to one guest CPU as without pinning — which is how it was found, and why it
-could not be attributed to a core from there.
+core. Under WSL2, where the rbx fault was first seen, it showed up just as often
+with the process pinned to one guest CPU as without pinning, and could not be
+attributed to a core. A sweep on Windows itself caught it on the core where the
+`CH` fault had been found.
 
 **Time it out.** `--cores all --minutes 20` on a 32-thread CPU is over ten
 hours. The tool prints the total before starting.
 
-In the shipped configuration (250 ns pacing) the original faulty core produced
-11 detections in 2.44·10⁹ checks — about 10 per 10 minutes. A core with less
-margin loss will take proportionally longer, which is why three runs of
-20 minutes is the floor rather than the target.
+In the shipped configuration (250 ns pacing) the original faulty core gave the
+`CH` probe 11 detections in 2.44·10⁹ checks — about 10 per 10 minutes. The rbx
+probe has fewer numbers behind it: one detection in the single minute the same
+core got in a sweep on Windows, and three in fifteen minutes under WSL2. A core
+with less margin loss will take proportionally longer, which is why three runs
+of 20 minutes is the floor rather than the target.
 
 ## Reading the output
 
@@ -248,24 +251,30 @@ clean bill of health.
 ### The rbx probe
 
 ```
---- cpu 0  (1 of 1) ---
-[05:37:36]   cpu 0   [    30s / 900s ]  passes 5716     detections 0
+--- cpu 12  (13 of 32) ---
 ...
-  DETECT cpu 0 pass 44297: access violation at emit_i16+0x229, rbx-rsp=0xa0 rbp-rsp=0xb0  [frame base moved by 0xa0]
+  DETECT cpu 12 pass 4081: access violation at emit_i16+0x229, rbx-rsp=0xa0 rbp-rsp=0xb0  [frame base moved by 0xa0]
+[06:38:04]   cpu 12  [    30s / 60s ]  passes 5601     detections 1
+[06:38:34]   cpu 12  [    60s / 60s ]  passes 11325    detections 1
 ...
 ======================== SUMMARY: rbx ========================
   cpu    passes       calls          detections   frame-base  other  hash
-  0      172841       45309231104    3            3           0      0
+...
+  11     11423        2994470912     0            0           0      0
+  12     11325        2968780800     1            1           0      0
+  13     11178        2930245632     0            0           0      0
+...
 ---------------------------------------------------------------
-CALLS PERFORMED:   45309231104   (one call = one frame set up, used and torn down through rbx)
-detections:        3
-kinds:             frame base moved by 0xa0: 3   other fault: 0   wrong hash: 0
+CALLS PERFORMED:   64960593920   (one call = one frame set up, used and torn down through rbx)
+detections:        1
+kinds:             frame base moved by 0xa0: 1   other fault: 0   wrong hash: 0
 
-RESULT: RBX FAULT DETECTED - 3 detections in 45309231104 calls across 1 core(s)
+RESULT: RBX FAULT DETECTED - 1 detections in 64960593920 calls across 32 core(s)
 ```
 
-(That run was made under WSL2, where "cpu 0" is a guest CPU and says nothing
-about which core failed. It is shown for the shape of the report.)
+(From a `--probe all` sweep of all 32 logical cores on Windows, one minute per
+core and probe. The `CH` half of the core's block is cut, and so are the other
+rows of the table: all zeroes.)
 
 A `DETECT` line is a hardware exception raised by the probe's own code, with
 the registers at that moment. `emit_i16+0x229` is the instruction; the two
@@ -343,7 +352,9 @@ call __asan_stack_malloc_0  inside: push %rbx ... rbx used as scratch ... pop %r
 ...
 mov  0x80(%rbx),%rcx
 call <hash step>            does not touch rbx at all
-mov  0x38(%rbx),%rdx        <- in every observed failure rbx is rsp+0xa0 by here
+mov  0x38(%rbx),%rdx        the epilogue reads its slots through rbx
+...
+movb $0x0,(%rax)            <- +0x229: the failures stop here, rbx = rsp+0xa0
 ...
 lea  -0x8(%rbp),%rsp ; pop %rbx ; pop %rbp ; ret
 ```
@@ -356,15 +367,15 @@ original kept failing. Whatever the trigger is, it lives in the exact
 instruction stream, and that stream comes from one compiler version and from
 the ASan runtime, which MinGW does not even have. So
 [`src/rbx_payload.S`](src/rbx_payload.S) holds the sixteen functions one pass
-executes — the loop, `emit_i16`, and the piece of the ASan runtime called on
+can reach — the loop, `emit_i16`, and the piece of the ASan runtime called on
 every iteration — copied instruction by instruction out of the binary that
 failed, each at its original address modulo 4096.
 [`tools/gen_rbx_payload.py`](tools/gen_rbx_payload.py) produced it and documents
-the three things that are not verbatim: displacements between functions, the
-read of the thread pointer (`%fs:0` becomes `%gs:0x28`, so the same bytes run
-on Windows), and `memset`, whose zero-length path is reproduced rather than
-copied. Linux and Windows
-binaries contain the same payload bytes.
+what is not verbatim: displacements that leave a function, the read of the
+thread pointer (`%fs:0` becomes `%gs:0x28`, so the same bytes run on Windows),
+the functions a pass never reaches, which become trap stubs, and `memset`, whose
+zero-length path is reproduced rather than copied. Linux and Windows binaries
+contain the same payload bytes.
 
 Whether a transplant still provokes the fault can only be settled by running
 it, so that was done: on the machine that has the fault, the original
@@ -377,13 +388,16 @@ each, so that both saw the same conditions.
 | the payload with the original `%fs` read | 4 | 660 s |
 | the payload as shipped, `%gs` read | 3 | 1020 s |
 | `sdcprobe --probe rbx` itself, one run | 3 | 900 s |
+| the Windows build on Windows itself, one minute on each of 32 logical cores | 1 | 1920 s |
 
-All fifteen stopped at the same instruction with the same two register
+All sixteen stopped at the same instruction with the same two register
 differences. The counts are too small to rank the rates, and the fault's own
 burstiness is larger than the gaps between them; what the table establishes is
-that the shipped bytes do fail, outside AddressSanitizer, and are caught. All of
-it was measured under WSL2, the only place the fault had been seen; nothing here
-says how often it shows on a pinned physical core.
+that the shipped bytes do fail, outside AddressSanitizer, and are caught. The
+first four rows were measured under WSL2, where the fault was first seen and a
+guest CPU is not a core. The last is a sweep with every logical core pinned in
+turn: its one failure came on the core where the `CH` fault had been found, and
+none on the other 31, though a minute each is far too short to call them clean.
 
 That code expects to live inside an ASan process, so the probe gives it the
 three things it actually uses: shadow memory at the fixed address ASan computes,
@@ -403,13 +417,15 @@ independently, outside the payload.
 **It needs AVX2**, because the copied path runs through two AVX instructions of
 `memset`, and it needs two fixed address ranges to be free, at 96 TiB and at
 12 TiB — which they are on Linux and on Windows 8.1 and later. Where either
-condition fails the probe refuses to start and says why.
+condition fails the probe refuses to start and says why: the tool exits with
+code 2 before testing anything, the `CH` half of `--probe all` included.
 
 ### Why one core at a time
 
-The tool is single-threaded on purpose. The fault appears on a single core at
-high boost, and any concurrent load suppresses it. Testing cores in parallel
-would be 32× faster and would find nothing. So the selected cores are visited in
+The tool is single-threaded on purpose. The `CH` fault appears on a single core
+at high boost, and any concurrent load suppresses it; the rbx fault stopped
+showing with sixteen busy threads beside it. Testing cores in parallel would be
+32× faster and would find nothing. So the selected cores are visited in
 sequence, each pinned with `sched_setaffinity` on Linux or
 `SetThreadGroupAffinity` on Windows, and the pin is verified rather than assumed.
 
@@ -461,9 +477,18 @@ that this *not* be reported as a single-byte misread.
 For the rbx probe it does the equivalent: it runs one clean pass and checks the
 hash, then makes `emit_i16` get back an `rbx` that is `0xa0` too high on its
 1000th call — the same change the fault makes — and requires that the
-exception is caught and that the next pass is clean again. That exercises the
-whole path a real detection takes, including the parts that differ between
-Linux and Windows.
+exception is caught and that the next pass is clean again. That exercises what
+a real detection goes through — the exception handler, the rewind, the rebuild
+— including the parts that differ between Linux and Windows. It does not
+exercise the sorting of a detection into *frame base*: the injected change
+comes earlier in the function than the real one, the function goes wrong in a
+different place, and the exception it ends in is not expected to carry the
+signature.
+
+On a CPU without AVX2 the rbx part is skipped, and the self-test says so. If the
+probe cannot be set up for another reason — its address ranges are taken, as on
+Windows before 8.1 — that part fails and so does the self-test as a whole,
+even though the `CH` part above it passed.
 
 It needs no faulty hardware. Run it first, on any machine, to confirm your
 binary is sound.
@@ -494,9 +519,10 @@ everyone was reporting in 2023–2024?**
 Related, not proven identical. That issue covers a range of symptoms, and Intel
 has publicly attributed at least one confirmed mechanism to it — "Vmin Shift
 Instability", caused by elevated operating voltage, addressed with microcode
-and BIOS updates. `sdcprobe` tests one specific, narrower thing: whether a
-single register read comes back correct. A machine can have that problem and
-pass this test, or the other way around: they are not the same question. See
+and BIOS updates. `sdcprobe` tests two specific, narrower things: whether a
+byte read through `CH` comes back correct, and whether a frame base kept in
+`rbx` keeps its value. A machine can have that problem and pass both tests, or
+the other way around: they are not the same question. See
 [Silent Data Corruption](#silent-data-corruption).
 
 **Does `RESULT: CLEAN` mean my CPU is fine?**
@@ -506,11 +532,13 @@ tested, at the pacing achieved — see
 bursty; a short run proves very little.
 
 **Does this run on AMD? On ARM?**
-Any x86-64 CPU, Intel or AMD — the `CH` register exists on all of them. The
-fault itself has so far only been reported on Intel 13th/14th generation
-desktop parts; whether it exists elsewhere is unknown, not ruled out. ARM,
-RISC-V and other non-x86 architectures have no legacy high-byte registers, so
-the question this tool asks does not exist there.
+Any x86-64 CPU, Intel or AMD — the `CH` register exists on all of them. The rbx
+probe additionally needs AVX2 and refuses to start without it. The faults
+themselves have so far only been reported on Intel 13th/14th generation desktop
+parts, the rbx one on a single machine; whether they exist elsewhere is unknown,
+not ruled out. ARM, RISC-V and other non-x86 architectures have no legacy
+high-byte registers and cannot execute the rbx probe's machine code, so neither
+question exists there.
 
 ## Background
 
@@ -539,11 +567,13 @@ heap-buffer-overflow with a truncated stack, a stack-buffer-underflow, a "member
 call on misaligned address", a jump to a garbage return address. The reports had
 one thing in common once the register dumps were lined up: `rbx - rsp = 0xa0` in
 a function where the two must be equal. Reduced to a single file,
-[`rbx-repro/`](rbx-repro/) fails once every 15 to 110 seconds on that
-machine when it runs alone, less with four busy threads beside it, and not at all with
-sixteen — the same dependence on single-core boost as before. That directory is
-kept as the provenance of the payload: it is the source the bytes were compiled
-from.
+[`rbx-repro/`](rbx-repro/) fails once every 15 to 140 seconds on that machine
+when it runs alone, less often with four busy threads beside it, and not at all
+with sixteen. Load on other cores hides this fault as well, though not simply
+by lowering the clock: with four busy threads the reproducer ran at the same
+speed. Its README has the numbers and what can be read from them. That
+directory is kept as the provenance of the payload: it is the source the bytes
+were compiled from.
 
 A plausible location, not an established one: P-cores of this generation
 execute `add`/`sub` with a small constant in the renamer, tracking a register
@@ -590,7 +620,7 @@ cmake --preset win
 cmake --build --preset win
 ```
 
-### A note on build flags
+### The rbx payload
 
 The rbx probe's payload, `src/rbx_payload.S`, is assembled by the same compiler
 driver as everything else and needs nothing extra. It is a generated file that
@@ -606,6 +636,8 @@ clang++ -g -O0 -std=c++20 -fsanitize=address,undefined -fno-sanitize-recover=all
         -fno-omit-frame-pointer -c -o repro.o repro.cpp
 python3 ../tools/gen_rbx_payload.py repro repro.o > ../src/rbx_payload.S
 ```
+
+### A note on build flags
 
 `CMAKE_INTERPROCEDURAL_OPTIMIZATION` is forced **off**, deliberately. The
 workload lives in its own translation unit so that the call from the hot loop

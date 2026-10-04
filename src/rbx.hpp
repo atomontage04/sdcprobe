@@ -62,8 +62,9 @@ inline constexpr uint64_t k_rbx_calls_per_pass = 64ull * 4096ull;
 // of rbx - rsp that identifies the fault.
 inline constexpr uint64_t k_rbx_signature_delta = 0xa0ull;
 
-// Whether this CPU can execute the payload at all: it contains two AVX2
-// instructions (from memset). On false, `reason` says what is missing.
+// Whether this CPU can execute the payload at all: it contains two VEX-encoded
+// instructions (from memset), one of them AVX2. On false, `reason` says what is
+// missing.
 bool sdc_rbx_supported(std::string& reason);
 
 // Maps the arena and its shadow, builds the data, installs fault capture.

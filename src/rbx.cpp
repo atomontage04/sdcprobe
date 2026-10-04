@@ -211,6 +211,14 @@ bool sdc_rbx_prepare(std::string& error) {
         error = "cannot install the hardware exception handler";
         return false;
     }
+    // Tried once here, where a refusal stops the probe with a message. Left to
+    // be discovered by sdc_rbx_run_pass, it would be counted as a detection on
+    // every pass.
+    if (!sdc_payload_tp_enter(&g_thread_area[9])) {
+        error = "cannot set the thread pointer the probe's code reads";
+        return false;
+    }
+    sdc_payload_tp_leave();
     g_expected_hash = build_arena();
     g_prepared = true;
     return true;
